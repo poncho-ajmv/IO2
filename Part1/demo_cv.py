@@ -312,7 +312,7 @@ HAND_MODEL_PATH = "yolov8n-hand.pt"   # cambia si tu checkpoint está en otra ru
 class HandRPSDetector:
     """
     Detector de manos con 21 keypoints + clasificación Piedra/Papel/Tijera mejorada.
-    - Umbrales normalizados por alto/ancho de la mano.
+    - Umbrales orient.-invariantes (longitud de dedo y ángulo).
     - Deducción de diestro/zurdo y ajuste por imagen espejada.
     """
     def __init__(self, model_path=HAND_MODEL_PATH, imgsz=640, conf=0.5, iou=0.45,
@@ -414,14 +414,39 @@ class HandRPSDetector:
 
     def _extended_finger(self, xy, name, H, alpha_up=0.035, alpha_tol=0.015):
         """
-        Dedo extendido si TIP claramente por encima (menor y) de PIP.
-        alpha_up se escala con H para robustez a distancia.
-        Devuelve (estado_binario, margen).
+        (Versión original por Y) Dedo extendido si TIP claramente por encima (menor y) de PIP.
         """
         mcp, pip, dip, tip = self.FINGERS[name]
         tip_y = xy[tip, 1]; pip_y = xy[pip, 1]
         margin = (pip_y - tip_y) / max(1.0, H)  # >0 si tip está arriba
         return (margin > alpha_up), margin
+
+    # ======= NUEVO: eje de la mano (wrist -> palma) =======
+    def _hand_axis(self, xy):
+        wrist = xy[self.WRIST]
+        mid_mcp = xy[self.FINGERS["middle"][0]]
+        idx_mcp = xy[self.FINGERS["index"][0]]
+        v = (mid_mcp - wrist) + (idx_mcp - wrist)  # promedio robusto
+        n = np.linalg.norm(v)
+        if n < 1e-6:
+            return np.array([0.0, -1.0], dtype=float)
+        return v / n  # unitario
+
+    # ======= NUEVO: dedo extendido orient.-invariante =======
+    def _extended_finger_oriented(self, xy, name, H, alpha_proj=0.06, ang_thr_deg=35):
+        mcp, pip, _, tip = self.FINGERS[name]
+        u = self._hand_axis(xy)                     # “arriba” de la mano
+        v_tip = xy[tip] - xy[mcp]
+        v_pip = xy[pip] - xy[mcp]
+        # proyección a lo largo del eje de la mano
+        proj_tip = float(np.dot(v_tip, u)) / max(1.0, H)
+        proj_pip = float(np.dot(v_pip, u)) / max(1.0, H)
+        margin = proj_tip - proj_pip               # >0 si la punta está más “arriba”
+        # ángulo del dedo respecto al eje de la mano (para evitar diagonales)
+        den = max(1e-6, np.linalg.norm(v_tip))
+        cosang = float(np.clip(np.dot(v_tip, u) / den, -1.0, 1.0))
+        ang = np.degrees(np.arccos(cosang))
+        return (margin > alpha_proj and ang < ang_thr_deg), margin
 
     def _extended_thumb(self, xy, W, alpha_side=0.035):
         """
@@ -430,53 +455,160 @@ class HandRPSDetector:
         _, mcp, ip, tip = self.FINGERS["thumb"]
         tip_x = xy[tip, 0]; ip_x = xy[ip, 0]
         is_right = self._is_right_hand(xy)
-        # Para derecha: tip más a la derecha que IP; para izquierda: más a la izquierda.
         if is_right:
             return ( (tip_x - ip_x) / max(1.0, W) > alpha_side )
         else:
             return ( (ip_x - tip_x) / max(1.0, W) > alpha_side )
 
+    def _palm_center_and_radius(self, xy):
+        """
+        Centro y radio de la palma a partir de WRIST + MCPs (5,9,13,17).
+        Radio = media de distancias al centro -> sirve como escala invariante.
+        """
+        wrist  = xy[self.WRIST]
+        mcp_i  = xy[self.FINGERS["index"][0]]
+        mcp_m  = xy[self.FINGERS["middle"][0]]
+        mcp_r  = xy[self.FINGERS["ring"][0]]
+        mcp_p  = xy[self.FINGERS["pinky"][0]]
+        P = np.stack([wrist, mcp_i, mcp_m, mcp_r, mcp_p], axis=0)
+        C = P.mean(axis=0)
+        R = float(np.mean(np.linalg.norm(P - C, axis=1)))
+        return C, max(1.0, R)
+
+    def _ring_pinky_near_center(self, xy, thr=0.90):
+        """
+        True si tips de anular y meñique están cerca del centro de la palma.
+        thr ~0.85–0.95 (más alto = más permisivo).
+        """
+        C, R = self._palm_center_and_radius(xy)
+        ring_tip  = xy[self.FINGERS["ring"][3]]   # 16
+        pinky_tip = xy[self.FINGERS["pinky"][3]]  # 20
+        dr = np.linalg.norm(ring_tip  - C) / R
+        dp = np.linalg.norm(pinky_tip - C) / R
+        return (dr <= thr) and (dp <= thr)
+
     def _clasificar(self, xy, bbox=None):
         """
-        Reglas robustas:
-        - Piedra: índice..meñique NO extendidos (tolerante), pulgar libre.
-        - Papel:  índice..meñique extendidos (tolerante), pulgar libre.
-        - Tijera: índice y medio extendidos; anular y meñique NO extendidos (tolerante).
+        Clasifica SIEMPRE en {Piedra, Papel, Tijera}.
+        - Reglas duras para Piedra y Papel.
+        - Tijera prioritaria cuando: solo hay dos dedos (índice+medio), o
+        anular/meñique están cerca de la palma, o la "V" no es muy abierta.
+        - Métricas invar. a orientación: separación normalizada por longitud de dedo + ángulo.
         """
         W, H = self._dims_from(xy, bbox)
 
-        ext_index, m_idx = self._extended_finger(xy, "index",  H)
-        ext_middle, m_mid= self._extended_finger(xy, "middle", H)
-        ext_ring, m_rin  = self._extended_finger(xy, "ring",   H)
-        ext_pinky, m_pin = self._extended_finger(xy, "pinky",  H)
-        # pulgar opcional (no rígido)
-        # ext_thumb = self._extended_thumb(xy, W)
+        # ===== Extensión orient.-invariante (bool, margen) =====
+        ext_index, m_idx  = self._extended_finger_oriented(xy, "index",  H)
+        ext_middle, m_mid = self._extended_finger_oriented(xy, "middle", H)
+        ext_ring,  m_rin  = self._extended_finger_oriented(xy, "ring",   H)
+        ext_pinky, m_pin  = self._extended_finger_oriented(xy, "pinky",  H)
 
-        # Tolerancias
-        tol_up   = 0.02   # ~2% alto mano para considerar “casi extendido”
-        tol_down = 0.01   # ~1% alto mano para considerar “casi doblado”
+        count_up4 = int(ext_index) + int(ext_middle) + int(ext_ring) + int(ext_pinky)
 
-        # Papel: todos extendidos (permitimos que alguno esté “casi”)
-        count_up = sum([ext_index, ext_middle, ext_ring, ext_pinky])
-        if count_up >= 3 and (m_idx>tol_up or m_mid>tol_up):
-            if ext_ring or m_rin>tol_up:
-                if ext_pinky or m_pin>tol_up:
-                    return "Papel"
+        # Tolerancias para márgenes
+        tol_up   = 0.02
+        tol_down = 0.01
+        # Papel más exigente en márgenes de "arriba"
+        tol_up_papel = 0.050  # antes 0.035
 
-        # Piedra: todos doblados (permitimos pequeñísimo margen)
-        if (not ext_index and m_idx < tol_down) and \
-           (not ext_middle and m_mid < tol_down) and \
-           (not ext_ring and m_rin < tol_down) and \
-           (not ext_pinky and m_pin < tol_down):
-            return "Piedra"
+        # ===== Índice vs Medio: separación (por longitud de dedo) + ángulo =====
+        i_mcp = xy[self.FINGERS["index"][0]]
+        m_mcp = xy[self.FINGERS["middle"][0]]
+        i_tip = xy[self.FINGERS["index"][3]]
+        m_tip = xy[self.FINGERS["middle"][3]]
 
-        # Tijera: índice y medio extendidos, anular y meñique doblados (tolerantes)
-        cond_up = (ext_index or m_idx>tol_up) and (ext_middle or m_mid>tol_up)
-        cond_dn = (not ext_ring or m_rin<tol_down) and (not ext_pinky or m_pin<tol_down)
-        if cond_up and cond_dn:
+        Li = np.linalg.norm(i_tip - i_mcp)
+        Lm = np.linalg.norm(m_tip - m_mcp)
+        L  = max(1.0, (Li + Lm) * 0.5)
+
+        sep = np.linalg.norm(i_tip - m_tip) / L
+        vi, vm = (i_tip - i_mcp), (m_tip - m_mcp)
+        den = max(1e-6, np.linalg.norm(vi) * np.linalg.norm(vm))
+        cosang  = float(np.clip(np.dot(vi, vm) / den, -1.0, 1.0))
+        ang_deg = float(np.degrees(np.arccos(cosang)))
+
+        # ===== Umbrales (Tijera más permisiva / Papel más exigente) =====
+        SEP_TIJERA = 0.72   # antes 0.62 (V más abierta aún cuenta como Tijera)
+        SEP_PAPEL  = 0.95   # antes 0.90 (Papel requiere apertura mayor)
+        ANG_TIJERA = 42.0   # antes 36.0 (más fácil ser Tijera)
+        ANG_PAPEL  = 68.0   # antes 60.0 (Papel requiere ángulo mayor)
+
+        # “Arriba” usando el eje de la mano
+        u = self._hand_axis(xy)
+        up_idx = (np.dot(i_tip - xy[self.WRIST], u) / max(1.0, H)) > 0.02
+        up_mid = (np.dot(m_tip - xy[self.WRIST], u) / max(1.0, H)) > 0.02
+
+        # ===== Anular+meñique cerca del centro de la palma => favorecer TIJERA =====
+        rp_thr = 0.965  # antes 0.94 (más permisivo para Tijera)
+        rp_near = self._ring_pinky_near_center(xy, thr=rp_thr)
+        if rp_near and (ext_index or m_idx > tol_up) and (ext_middle or m_mid > tol_up):
             return "Tijera"
 
-        return "Desconocido"
+        # ===== PAPEL (regla dura: 4 dedos bien extendidos y mano realmente abierta) =====
+        if (ext_index and ext_middle and ext_ring and ext_pinky and
+            (m_idx > tol_up_papel) and (m_mid > tol_up_papel) and
+            (m_rin > tol_up_papel) and (m_pin > tol_up_papel) and
+            (sep >= SEP_PAPEL or ang_deg >= ANG_PAPEL)):
+            return "Papel"
+
+        # ===== PIEDRA (regla dura) =====
+        if (not ext_index and m_idx < tol_down) and \
+        (not ext_middle and m_mid < tol_down) and \
+        (not ext_ring  and m_rin < tol_down) and \
+        (not ext_pinky and m_pin < tol_down):
+            return "Piedra"
+
+        # ===== REGLA DURA: exactamente dos dedos (índice+medio) arriba => TIJERA =====
+        if (count_up4 == 2) and ext_index and ext_middle and (not ext_ring) and (not ext_pinky):
+            return "Tijera"
+
+        # ===== TIJERA / PAPEL con 2 dedos arriba =====
+        cond_up = (ext_index or m_idx > tol_up) and (ext_middle or m_mid > tol_up)
+        cond_dn = (not ext_ring or m_rin < tol_down) and (not ext_pinky or m_pin < tol_down)
+        if cond_up and cond_dn:
+            # Más permisivo para Tijera
+            if (sep <= SEP_TIJERA) or (ang_deg <= ANG_TIJERA):
+                return "Tijera"
+
+            # Para que sea PAPEL con solo dos dedos visibles:
+            # Debe ser MUY abierto, ambos (índice y medio) claramente arriba
+            # y que asomen ANULAR **y** MEÑIQUE (ambos).
+            very_open = (sep >= SEP_PAPEL) and (ang_deg >= ANG_PAPEL) and (up_idx and up_mid)
+            if very_open and (ext_ring and ext_pinky):
+                return "Papel"
+
+            # Resto: mantener TIJERA
+            return "Tijera"
+
+        # ===== TIJERA (relajación adicional y fallback) =====
+        # (a) Si la V es moderada y alguno de los otros dos no está claramente extendido.
+        if (cond_up and ((sep <= SEP_TIJERA*1.05) or (ang_deg <= ANG_TIJERA+4)) and
+            (m_rin < tol_up_papel or m_pin < tol_up_papel)):
+            return "Tijera"
+
+        # (b) “dos dedos muy juntos”: al menos uno algo arriba para evitar puño.
+        if (sep <= SEP_TIJERA) and (up_idx or up_mid) and (ext_index or ext_middle):
+            return "Tijera"
+
+        # ===== PUNTAJE DE SIMILITUD (si nada calza) =====
+        def pos(x, b=0.015):  # aporte por estar extendido
+            return max(0.0, x - b)
+        def neg(x, b=0.02):   # aporte por estar doblado
+            return max(0.0, b - x)
+
+        # Penalizo más a Papel por "apertura" y premio más a Tijera por pareja
+        bonus_spread_papel = max(0.0, sep - SEP_PAPEL) * 0.15   # antes 0.25
+        bonus_pair_tijera  = max(0.0, SEP_TIJERA - sep) * 1.30  # antes 1.10
+
+        score_papel  = pos(m_idx) + pos(m_mid) + pos(m_rin) + pos(m_pin) + bonus_spread_papel
+        score_piedra = neg(m_idx) + neg(m_mid) + neg(m_rin) + neg(m_pin)
+        score_tijera = pos(m_idx) + pos(m_mid) + neg(m_rin) + neg(m_pin) + bonus_pair_tijera
+
+        scores = {"Piedra": score_piedra, "Papel": score_papel, "Tijera": score_tijera}
+        return max(scores, key=scores.get)
+
+
+
 
     def draw(self, canvas, kpts, boxes):
         if kpts is None:
