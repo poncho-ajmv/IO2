@@ -2,6 +2,9 @@
 
 Este repositorio acompaña la presentación **“Computer Vision”** y resume sus ideas clave, flujo de trabajo y áreas de aplicación. Al final encontrarás una breve **demostración** que utiliza la imagen `image.png`.
 
+https://www.youtube.com/watch?v=vT1JzLTH4G4&list=PLM8tY-iXxZGwghV9VpEvdjxOm18-Qpfga
+
+
 https://cs231n-stanford-edu.translate.goog/?_x_tr_sl=en&_x_tr_tl=es&_x_tr_hl=es&_x_tr_pto=tc
 
 ---
