@@ -111,3 +111,30 @@ A continuación se incluye una imagen de ejemplo para ilustrar el flujo de traba
 
 https://www4.ujaen.es/~satorres/practicas/practica3_vc.pdf
 
+
+Identidad: deja la imagen igual (sin cambio).
+
+Eje básico: detector de bordes tipo laplaciano (resalta contornos en todas direcciones).
+
+Desenfoque básico: blur por caja 3×3 (suaviza, quita ruido fino).
+
+Desenfoque Gaussiano: blur gaussiano 5×5 (suaviza de forma más natural).
+
+Enfocar: filtro sharpen 3×3 (aumenta nitidez/contornos).
+
+Realzar: realce/relieve direccional (acentúa bordes con efecto “emboss” ligero).
+
+Sobel horizontal: resalta bordes horizontales (cambios verticales).
+
+Sobel vertical: resalta bordes verticales (cambios horizontales).
+
+Sobel HyV: magnitud del gradiente (bordes en todas direcciones).
+
+Sobel HyV con Blur: igual, pero con suavizado previo (bordes más limpios).
+
+Sobel HyV con Blur y TH: añade umbral (TH) para mostrar solo bordes fuertes.
+
+Sobel colorizado: color = dirección del borde, brillo = intensidad.
+
+Sobel colorizado con Blur: lo mismo, con suavizado para reducir ruido cromático.
+
